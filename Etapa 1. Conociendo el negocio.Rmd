@@ -1,0 +1,294 @@
+---
+title: "Etapa 1. Conociendo el negocio"
+output:
+  word_document: default
+  html_document: default
+date: "2025-08-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(lubridate)
+library(janitor)
+library(purrr)
+library(openxlsx)
+library(zoo)
+library(imputeTS)
+```
+
+```{r}
+# --- helpers simples ---
+mask_short_na_runs <- function(x, maxlen) {
+  nas <- is.na(x); r <- rle(nas)
+  ends <- cumsum(r$lengths); starts <- ends - r$lengths + 1
+  mask <- rep(FALSE, length(x))
+  for (i in seq_along(r$lengths)) {
+    if (r$values[i]) {
+      if (r$lengths[i] <= maxlen) mask[starts[i]:ends[i]] <- TRUE
+    }
+  }
+  mask
+}
+
+safe_kalman_struct <- function(x) {
+  out <- tryCatch(
+    suppressWarnings(na_kalman(x, model = "StructTS")),
+    warning = function(w) x,
+    error   = function(e) x
+  )
+  out
+}
+
+fill_two_stage <- function(v, maxgap_linear = 6, maxgap_kalman = 24) {
+  # 1) lineal
+  out <- na.approx(v, maxgap = maxgap_linear, na.rm = FALSE)
+  # 2) kalman solo en huecos cortos restantes
+  if (maxgap_kalman > 0) {
+    still_na <- is.na(out)
+    if (any(still_na)) {
+      short_mask <- mask_short_na_runs(v, maxgap_kalman)
+      apply_mask <- still_na & short_mask
+      if (any(apply_mask)) {
+        kal <- safe_kalman_struct(v)
+        out[apply_mask] <- kal[apply_mask]
+      }
+    }
+  }
+  out
+}
+
+to_text_ymd_hms <- function(x) {
+  if (inherits(x,"POSIXct") || inherits(x,"POSIXt") || inherits(x,"Date")) {
+    return(format(as.POSIXct(x, tz="America/Monterrey"), "%Y-%m-%d %H:%M:%S"))
+  }
+  if (is.numeric(x)) {
+    return(format(as.POSIXct(x*86400, origin="1899-12-30", tz="America/Monterrey"), "%Y-%m-%d %H:%M:%S"))
+  }
+  as.character(x)
+}
+
+
+```
+
+En este bloque se definen funciones de apoyo para el preprocesamiento de series temporales. El objetivo es poder identificar tramos cortos de datos faltantes e imputarlos de manera controlada: primero con interpolación lineal en huecos pequeños y después, en intervalos un poco mayores, con un filtro de Kalman basado en modelos estructurales. Los huecos largos se mantienen como NA para no introducir información artificial. Además, se incluye una rutina para estandarizar la columna de fechas y expresarla en un formato uniforme legible (“YYYY-mm-dd HH:MM:SS”), evitando problemas con números seriales de Excel.
+
+
+```{r}
+input_file <- c("DATOS HISTÓRICOS 2023_2024_TODAS ESTACIONES_ITESM.xlsx")
+
+maxgap_linear  <- 6   # horas
+maxgap_kalman  <- 24  # horas
+```
+
+Este fragmento define los insumos y parámetros básicos del preprocesamiento. Primero se especifica el archivo original que contiene todas las series de calidad del aire y meteorología. Después se establecen los umbrales de imputación: huecos de hasta 6 horas se rellenan mediante interpolación lineal y vacíos de hasta 24 horas se pueden imputar con el filtro de Kalman. Esto permite un control claro de hasta qué punto se reconstruyen las series sin alterar en exceso su variabilidad real.
+
+
+```{r}
+arreglar_hoja_maestra <- function(input_file,
+                                     sheet = "Param_horarios_Estaciones",
+                                     output_file = NULL,
+                                     maxgap_linear = 6,
+                                     maxgap_kalman = 24) {
+  if (is.null(output_file)) {
+    base <- tools::file_path_sans_ext(basename(input_file))
+    output_file <- paste0(base, "_CORREGIDO.xlsx")
+  }
+
+  raw <- read_excel(input_file, sheet = sheet, col_names = FALSE,
+                    na = c("", "NULL","null","NaN","NA"))
+  if (nrow(raw) < 3) stop("La hoja no tiene las 2 filas de encabezado + datos.")
+
+  ncols <- ncol(raw)
+  vars  <- as.character(unlist(raw[1, 1:ncols]))
+  units <- as.character(unlist(raw[2, 1:ncols]))
+
+  if (!grepl("date|fecha|hora", tolower(vars[1] %||% ""))) {
+    message("Aviso: la primera columna no luce como fecha; se forzará a 'date'.")
+  }
+  vars[1]  <- "date"
+  if (is.na(units[1]) || units[1] == "") units[1] <- "-"
+
+  if (length(vars)  < ncols) vars  <- c(vars,  paste0("col_", seq_len(ncols - length(vars))))
+  if (length(units) < ncols) units <- c(units, rep("-", ncols - length(units)))
+
+  dat <- raw[-c(1,2), , drop = FALSE]
+  vars_unique <- make.unique(vars, sep = "_")
+  names(dat) <- vars_unique
+
+  all_na_col <- vapply(dat, function(x) all(is.na(x)), logical(1))
+  empty_name <- vars_unique == "" | is.na(vars_unique)
+  keep <- !(all_na_col | empty_name)
+  dat          <- dat[,  keep, drop = FALSE]
+  vars_unique  <- vars_unique[keep]
+  units        <- units[keep]
+
+  if (!"date" %in% vars_unique) stop("No se encontró columna 'date' tras normalizar encabezados.")
+
+  date_col <- which(vars_unique == "date")[1]
+  ord <- order(suppressWarnings(as.numeric(dat[[date_col]])), na.last = TRUE)
+  dat <- dat[ord, , drop = FALSE]
+
+  num_cols <- setdiff(names(dat), "date")
+  for (col in num_cols) {
+    dat[[col]] <- suppressWarnings(as.numeric(dat[[col]]))
+  }
+
+  corrected <- dat
+  for (col in num_cols) {
+    v <- corrected[[col]]
+    if (is.numeric(v)) corrected[[col]] <- fill_two_stage(v, maxgap_linear, maxgap_kalman)
+  }
+
+  corrected$date <- to_text_ymd_hms(corrected$date)
+
+  options("openxlsx.na.string" = NA)
+  wb <- createWorkbook()
+  addWorksheet(wb, sheet)
+
+  writeData(wb, sheet, t(vars_unique), startRow = 1, startCol = 1,
+            colNames = FALSE, rowNames = FALSE)
+
+  writeData(wb, sheet, t(units),       startRow = 2, startCol = 1,
+            colNames = FALSE, rowNames = FALSE)
+
+  writeData(wb, sheet, corrected,      startRow = 3, startCol = 1,
+            colNames = FALSE, rowNames = FALSE, na.string = NA)
+  
+  date_style <- openxlsx::createStyle(numFmt = "yyyy-mm-dd hh:mm:ss")
+  openxlsx::addStyle(
+    wb, sheet,
+    style = date_style,
+    rows = 3:(nrow(corrected) + 2),  
+    cols = 1,                         
+    gridExpand = TRUE
+)
+
+
+  saveWorkbook(wb, output_file, overwrite = TRUE)
+  message("Listo: ", output_file)
+  return(output_file)
+}
+
+```
+
+Este bloque define la función arreglar_hoja_maestra, pensada para limpiar y estandarizar la hoja “maestra” del archivo original que tiene dos filas de encabezado (variables y unidades). El flujo es: primero se leen crudos los encabezados y datos para preservar toda la estructura original; después se normaliza la columna de fechas, se eliminan columnas vacías o duplicadas y se ordena la serie temporal. A continuación se convierten los contaminantes y variables meteorológicas a numéricos y se reconstruyen huecos cortos con el esquema de interpolación lineal y filtro de Kalman. Finalmente, la columna de fecha se reescribe en formato legible y todo se exporta a Excel manteniendo en las dos primeras filas los encabezados y unidades originales. En resumen: esta función prepara la hoja base para que quede consistente, imputada y lista para análisis posteriores sin perder la información de metadatos.
+
+
+```{r}
+# Correr 
+arreglar_hoja_maestra(input_file,
+                      sheet = "Param_horarios_Estaciones",
+                       output_file = NULL,
+                       maxgap_linear = 6,
+                       maxgap_kalman = 24)
+
+# Ver un log de rellenos (opcional)
+```
+
+```{r}
+
+input_file  <- "DATOS HISTÓRICOS 2023_2024_TODAS ESTACIONES_ITESM_CORREGIDO.xlsx"
+output_file <- sub("\\.xlsx$", "_POSTQC.xlsx", input_file)
+
+PM10_CAP <- 1000
+O3_CAP   <- 400
+NA_DROP_FRAC <- 0.70
+
+sheets <- excel_sheets(input_file)
+wb <- createWorkbook()
+
+for (sh in sheets) {
+  message("Procesando hoja: ", sh)
+  df <- read_excel(input_file, sheet = sh)
+
+  if (!is.data.frame(df) || ncol(df) <= 1) {
+    addWorksheet(wb, sh); writeData(wb, sh, df); next
+  }
+
+  if ("date" %in% names(df)) {
+    d <- df[["date"]]
+
+    d_chr <- as.character(d)
+    d_chr[trimws(d_chr) %in% c("-", "", "NA", "NaN", "null", "NULL")] <- NA
+
+    has_comma <- grepl(",", d_chr, fixed = TRUE)
+    d_chr[has_comma] <- gsub(",", ".", d_chr[has_comma], fixed = TRUE)
+
+    dn <- suppressWarnings(as.numeric(d_chr))
+    frac_num <- mean(!is.na(dn))
+    if (frac_num > 0.6 || all(!is.na(dn))) {
+      d_posix <- as.POSIXct(dn * 86400, origin = "1899-12-30", tz = "America/Mexico_City")
+    } else {
+      d_posix <- suppressWarnings(parse_date_time(
+        d_chr,
+        orders = c(
+          "Y-m-d H:M:S", "Y-m-d H:M",
+          "Y/m/d H:M:S", "Y/m/d H:M",
+          "d/m/Y H:M:S", "d/m/Y H:M",
+          "m/d/Y H:M:S", "m/d/Y H:M",
+          "Y-m-d", "Y/m/d", "d/m/Y", "m/d/Y"
+        ),
+        tz = "America/Mexico_City",
+        exact = FALSE
+      ))
+      if (mean(!is.na(d_posix)) < 0.5 && any(!is.na(dn))) {
+        d_posix <- as.POSIXct(dn * 86400, origin = "1899-12-30", tz = "America/Mexico_City")
+      }
+    }
+
+    df[["date"]] <- d_posix
+  }
+
+  if ("PM10" %in% names(df)) {
+    num <- suppressWarnings(as.numeric(df[["PM10"]]))
+    idx <- !is.na(num) & num > PM10_CAP
+    if (any(idx)) df[idx, "PM10"] <- NA
+  } else if ("pm10" %in% names(df)) {
+    num <- suppressWarnings(as.numeric(df[["pm10"]]))
+    idx <- !is.na(num) & num > PM10_CAP
+    if (any(idx)) df[idx, "pm10"] <- NA
+  }
+
+  if ("O3" %in% names(df)) {
+    num <- suppressWarnings(as.numeric(df[["O3"]]))
+    idx <- !is.na(num) & num > O3_CAP
+    if (any(idx)) df[idx, "O3"] <- NA
+  } else if ("o3" %in% names(df)) {
+    num <- suppressWarnings(as.numeric(df[["o3"]]))
+    idx <- !is.na(num) & num > O3_CAP
+    if (any(idx)) df[idx, "o3"] <- NA
+  }
+
+  na_frac <- sapply(df, function(x) mean(is.na(x)))
+  to_drop <- setdiff(names(df)[na_frac > NA_DROP_FRAC], "date")
+  if (length(to_drop)) {
+    df <- df[, setdiff(names(df), to_drop), drop = FALSE]
+  }
+
+  addWorksheet(wb, sh)
+  writeData(wb, sh, df)
+
+  if ("date" %in% names(df) && inherits(df[["date"]], "POSIXct")) {
+    date_col <- which(names(df) == "date")
+    if (length(date_col) == 1) {
+      date_style <- createStyle(numFmt = "yyyy-mm-dd hh:mm:ss")
+      addStyle(wb, sh, style = date_style,
+               rows = 2:(nrow(df) + 1), cols = date_col,
+               gridExpand = TRUE, stack = TRUE)
+    }
+  }
+}
+
+saveWorkbook(wb, output_file, overwrite = TRUE)
+message("Listo ✓ Guardado como: ", output_file)
+
+```
+
+Este bloque recorre todas las hojas del archivo ya corregido para aplicar un control de calidad final y estandarizar la columna temporal antes de guardar un libro nuevo. Primero, detecta y normaliza la variable date: limpia símbolos o cadenas ambiguas, convierte seriales de Excel a fecha-hora local y, si vienen como texto, intenta varios formatos comunes hasta obtener un POSIXct consistente; además, aplica un formato de visualización en Excel para que la fecha se vea como “yyyy-mm-dd hh:mm:ss”. Después, implementa reglas mínimas de depuración sobre outliers instrumentales: valores de PM10 por encima de 1000 µg/m³ y de O3 por encima de 400 ppb se recodifican como faltantes para evitar que picos no plausibles sesguen los análisis. Finalmente, elimina columnas con más de 70% de datos faltantes (conservando siempre la columna date), y escribe cada hoja depurada en un nuevo archivo, manteniendo nombres y estructura originales. Con esto se asegura una base homogénea, sin extremos espurios ni variables prácticamente vacías.
